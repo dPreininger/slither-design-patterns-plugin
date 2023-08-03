@@ -1,0 +1,330 @@
+#! /usr/bin/env python3
+
+import os
+import sys
+import subprocess
+import re
+import threading
+
+class Results:
+    all_functions = 0
+    public_functions = 0
+
+    guard_check_warnings = 0
+    input_guard_checks = 0
+    state_guard_checks = 0
+    auth_guard_checks = 0
+    percentage_unguarded = 0
+
+    facade_pattern_warnings = 0
+    facade_patterns = 0
+
+    stopable_contracts = []
+
+    contracts_with_oracles = []
+
+    def __str__(self):
+        return f"""CONTRACT INFO:
+All functions: {self.all_functions}
+Public functions: {self.public_functions}
+
+GUARD CHECK PATTERN:
+Guard check warnings: {self.guard_check_warnings}
+Input guard checks: {self.input_guard_checks}
+State guard checks: {self.state_guard_checks}
+Auth guard checks: {self.auth_guard_checks}
+Total guard checks: {self.input_guard_checks + self.state_guard_checks + self.auth_guard_checks}
+Percentage of unguarded public functions: {self.percentage_unguarded}
+
+FACADE PATTERN:
+Facade pattern warnings: {self.facade_pattern_warnings}
+Facade patterns: {self.facade_patterns}
+
+EMERGENCY STOP PATTERN:
+Stopable contracts: {', '.join(self.stopable_contracts) if self.stopable_contracts else 'None'}
+
+ORACLE PATTERN:
+Contracts with oracles: {', '.join(self.contracts_with_oracles) if self.contracts_with_oracles else 'None'}
+"""
+    
+    def __repr__(self):
+        return self.__str__()
+
+class Analysis:
+    dependencies_base_path: str = None
+    contracts_base_path: str = None
+    results = Results()
+    _dependencies: list[str] = None
+    _solc_remaps: str = None
+    _solidity_source_files: list[str] = None
+
+    def __init__(self, contract_base_path: str, dependencies_base_path: str = None):
+        self.contracts_base_path = contract_base_path
+        self.dependencies_base_path = dependencies_base_path
+
+    @property
+    def dependencies(self):
+        if self._dependencies is not None:
+            return self._dependencies
+
+        return os.listdir(self.dependencies_base_path)
+
+    @property
+    def solc_remaps(self):
+        if self._solc_remaps is not None:
+            return self._solc_remaps
+        
+        if self.dependencies_base_path is None:
+            return None
+        
+        if not os.path.exists(self.dependencies_base_path):
+            return None
+        
+        parts = map(lambda dep: f'{dep}={os.path.join(self.dependencies_base_path, dep)}', self.dependencies)
+
+        self._solc_remaps = ' '.join(parts)
+        return self._solc_remaps
+    
+    @property
+    def solidity_source_files(self):
+        if self._solidity_source_files is not None:
+            return self._solidity_source_files
+        
+        sol_files_arr = []
+        for root, dirs, files in os.walk(self.contracts_base_path):
+            sol_files = map(lambda f: os.path.join(root, f),filter(lambda file: file.endswith('.sol'), files))
+            sol_files_arr.extend(sol_files)
+
+        self._solidity_source_files = sol_files_arr
+            
+        return self._solidity_source_files
+            
+
+    def cmd(command):
+        process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return process.communicate() # stdout, stderr
+
+    def slither_detect(self, contract_path: str, detector: str) -> str:
+        if self.solc_remaps:
+            _, err = Analysis.cmd(f'slither {contract_path} --detect {detector} --solc-remaps "{self.solc_remaps}"')
+            return err.decode()
+        else:
+            _, err = Analysis.cmd(f'slither {contract_path} --detect {detector}')
+            return err.decode()
+
+    def run_contract_info(self):
+        valid_lines = ''
+
+        for file in self.solidity_source_files:
+            self.check_solc_version(file)
+            self.check_deps(file)
+
+            output = self.slither_detect(file, 'contract-info')
+
+            lines = output.split('\n')
+            valid_lines += '\n'.join(filter(lambda line: line.startswith('DETECTOR INFO: Contract'), lines))
+            valid_lines += '\n'
+
+        # deduplicate lines
+        valid_lines = set(valid_lines.split('\n'))
+        valid_lines = list(filter(lambda line: line != '', valid_lines))
+
+        all_funcs_per_contract = map(lambda line: int(line.split(' ')[5]), valid_lines)
+        self.results.all_functions += sum(all_funcs_per_contract)
+
+        public_funcs_per_contract = map(lambda line: int(line.split(' ')[7]), valid_lines)
+        self.results.public_functions += sum(public_funcs_per_contract)
+
+    def run_guard_check(self):
+        warning_lines = ''
+        guard_info_lines = ''
+
+        for file in self.solidity_source_files:
+            output = self.slither_detect(file, 'guard-check')
+
+            lines = output.split('\n')
+
+            warning_lines += '\n'.join(filter(lambda line: line.startswith('DETECTOR WARNING: No Guard Patterns'), lines))
+            warning_lines += '\n'
+
+            guard_info_lines += '\n'.join(filter(lambda line: line.startswith('DETECTOR INFO: Function'), lines))
+            guard_info_lines += '\n'
+
+        # deduplicate lines
+        warning_lines = set(warning_lines.split('\n'))
+        warning_lines = list(filter(lambda line: line != '', warning_lines))
+        guard_info_lines = set(guard_info_lines.split('\n'))
+        guard_info_lines = list(filter(lambda line: line != '', guard_info_lines))
+
+        input_guard_checks_per_contract = map(lambda line: int(line.split(' ')[-4]), guard_info_lines)
+        self.results.input_guard_checks = sum(input_guard_checks_per_contract)
+
+        state_guard_checks_per_contract = map(lambda line: int(line.split(' ')[-9]), guard_info_lines)
+        self.results.state_guard_checks = sum(state_guard_checks_per_contract)
+
+        auth_guard_checks_per_contract = map(lambda line: int(line.split(' ')[-13]), guard_info_lines)
+        self.results.auth_guard_checks = sum(auth_guard_checks_per_contract)
+
+        self.results.guard_check_warnings = len(warning_lines)
+
+    def run_facade(self):
+        info_lines = ''
+        warning_lines = ''
+
+        for file in self.solidity_source_files:
+            output = self.slither_detect(file, 'facade')
+
+            lines = output.split('\n')
+
+            warning_lines += '\n'.join(filter(lambda line: line.startswith('DETECTOR WARNING: Chained external calls'), lines))
+            warning_lines += '\n'
+
+            info_lines += '\n'.join(filter(lambda line: line.startswith('DETECTOR INFO: Facade pattern detected'), lines))
+            info_lines += '\n'
+
+        # deduplicate lines
+        warning_lines = set(warning_lines.split('\n'))
+        warning_lines = list(filter(lambda line: line != '', warning_lines))
+        info_lines = set(info_lines.split('\n'))
+        info_lines = list(filter(lambda line: line != '', info_lines))
+
+        self.results.facade_pattern_warnings = len(warning_lines)
+        self.results.facade_patterns = len(info_lines)
+
+    def run_emergency_stop(self):
+        info_lines = ''
+
+        for file in self.solidity_source_files:
+            output = self.slither_detect(file, 'emergency-stop')
+
+            lines = output.split('\n')
+
+            info_lines += '\n'.join(filter(lambda line: line.startswith('DETECTOR INFO: Emergency Stop'), lines))
+            info_lines += '\n'
+
+
+        # deduplicate lines
+        info_lines = set(info_lines.split('\n'))
+        info_lines = list(filter(lambda line: line != '', info_lines))
+
+        self.results.stopable_contracts.extend(map(lambda line: line.split(' ')[-1].replace('.', ''), info_lines))
+
+    def run_oracle(self):
+        info_lines = ''
+
+        for file in self.solidity_source_files:
+            output = self.slither_detect(file, 'oracle')
+
+            lines = output.split('\n')
+
+            info_lines += '\n'.join(filter(lambda line: line.startswith('DETECTOR INFO: Contract'), lines))
+            info_lines += '\n'
+
+
+        # deduplicate lines
+        info_lines = set(info_lines.split('\n'))
+        info_lines = list(filter(lambda line: line != '', info_lines))
+
+        self.results.contracts_with_oracles.extend(map(lambda line: line.split(' ')[3], info_lines))
+
+    def run_statistics(self):
+        self.results.percentage_unguarded = self.results.guard_check_warnings / self.results.public_functions
+
+    def check_solc_version(self, file: str):
+        solc_version_output: bytes = Analysis.cmd('solc --version')[0]
+
+        solc_regex = re.compile(r'[\^>=]*[0-9]+\.[0-9]+\.[0-9]+')
+        solc_version = solc_regex.search(solc_version_output.decode()).group(0)
+
+        with open(file) as f:
+            text = f.read()
+
+            pragma_regex = re.compile(r'pragma solidity .*;')
+            pragma_line = pragma_regex.search(text).group(0)
+            pragma_version = solc_regex.search(pragma_line).group(0)
+
+        if solc_version in pragma_version:
+            return
+        
+        caret_regex = re.compile(r'\^')
+        caret = caret_regex.search(pragma_version)
+
+        more_regex = re.compile(r'>=')
+        more = more_regex.search(pragma_version)
+
+        solc_major_version = solc_version.split('.')[1]
+        pragma_major_version = pragma_version.split('.')[1]
+
+        solc_minor_version = solc_version.split('.')[2]
+        pragma_minor_version = pragma_version.split('.')[2]
+
+        solc_major_version_same = solc_major_version == pragma_major_version
+        solc_major_version_higher_or_same = int(solc_major_version) >= int(pragma_major_version)
+        solc_minor_version_higher_or_same = int(solc_minor_version) >= int(pragma_minor_version)
+
+        if not((caret and solc_major_version_same and solc_minor_version_higher_or_same) or (more and solc_major_version_higher_or_same and (solc_minor_version_higher_or_same or not solc_major_version_same))):
+            print(f'WARNING: Solc version mismatch in file {file}')
+            print(f'Solc version used by slither: {solc_version}')
+            print(f'Solc version used by contracts: {pragma_version}\n\n')
+
+    def check_deps(self, file: str):
+        with open(file) as f:
+            text = f.read()
+
+            import_regex = re.compile(r'import .*[\'"].*[\'"];')
+            imports = import_regex.findall(text)
+
+            file_path_regex = re.compile(r'[\'"].*[\'"]')
+
+            for import_line in imports:
+                file_path = file_path_regex.search(import_line).group(0).replace('\'', '').replace('"', '')
+
+                if file_path.startswith('./') or file_path.startswith('../'):
+                    continue
+
+                dep_name = file_path.split('/')[0]
+
+                if dep_name not in self.dependencies:
+                    print(f'WARNING: Dependency {dep_name} not found in dependencies folder\n\n')
+
+
+    def start_analysis(self):
+        source_files = self.solidity_source_files # prebuild this array
+
+        contract_info_thread = threading.Thread(target=self.run_contract_info)
+        guard_check_thread = threading.Thread(target=self.run_guard_check)
+        facade_thread = threading.Thread(target=self.run_facade)
+        emergency_stop_thread = threading.Thread(target=self.run_emergency_stop)
+        oracle_thread = threading.Thread(target=self.run_oracle)
+
+        contract_info_thread.start()
+        guard_check_thread.start()
+        facade_thread.start()
+        emergency_stop_thread.start()
+        oracle_thread.start()
+
+        contract_info_thread.join()
+        guard_check_thread.join()
+        facade_thread.join()
+        emergency_stop_thread.join()
+        oracle_thread.join()
+
+        self.run_statistics()
+
+        print(self.results)
+
+
+def main(base_path: str, deps_path: str = None):
+    analysis = Analysis(base_path, deps_path)
+
+    analysis.start_analysis()
+
+if __name__ == '__main__':
+    if len(sys.argv) < 2:
+        print('Usage: python3 analyze.py <path-to-contracts-base-folder> <path-to-base-dependencies-folder>')
+        exit(1)
+
+    if len(sys.argv) > 2:
+        main(sys.argv[1], sys.argv[2])
+    else:
+        main(sys.argv[1])
